@@ -188,7 +188,7 @@ if __name__ == "__main__":
     #print_first_three_sentences_and_clauses()
     print_boundary_distribution()
     print_average_sentence_length()
-    #print_average_clause_length()
+    print_average_clause_length()
     #print_clauses_per_sentence()
     #print_suspicious_examples()
     #print_small_clauses()

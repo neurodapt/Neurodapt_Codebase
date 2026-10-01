@@ -7,6 +7,7 @@
 \usepackage{xurl}
 \usepackage{cite}
 \usepackage{balance}
+\usepackage{float}
 \graphicspath{{./}{figures/}}
 \DeclareGraphicsExtensions{.png,.pdf,.jpg}
 \setlength{\textfloatsep}{3pt plus 1pt minus 1pt}
@@ -114,81 +115,97 @@ The complete framework therefore consists of three main components: clause segme
 
 \subsection{Motivation and Problem Formulation}
 
-We use clauses as the basic unit of memory analysis because they are more informative than individual tokens while remaining more specific than full sentences. A clause typically expresses an event, action, state, or proposition that can be treated as a distinct unit of information. A sentence may contain several such events, making sentence-level scoring too coarse for relative memorability. Clause segmentation therefore provides a practical middle ground between token-level and sentence-level representations \\cite{seyfried2024}.
+We use clauses as the basic unit of memory analysis because they provide a linguistically meaningful unit between individual tokens and complete sentences. A clause can express an event, action, state, or proposition that can be treated as a distinct unit of information. In contrast, a sentence may contain multiple such propositions, making sentence-level analysis relatively coarse for estimating the contribution of individual textual units. Clause segmentation therefore provides a practical intermediate representation between token-level and sentence-level analysis \cite{seyfried2024}.
 
-\subsection{HCA Dataset and Preprocessing}
+Given a sentence $S=(w_1,w_2,\ldots,w_n)$, the objective of the segmentation module is to predict whether each token position corresponds to the beginning of a new clause. The task is formulated as binary sequence prediction, where each token is assigned a boundary label $y_i\in\{0,1\}$.
 
-The clause boundary predictor is trained on the English HCA dataset (\texttt{eng.hca.amr}) from HCASeg \cite{yu2023}. The corpus is provided in CoNLL-U format, with clause boundaries marked by \texttt{BeginSeg=Yes} in the \texttt{MISC} field. We use the original training, development, and test partitions.
+\subsection{HCA Dataset and Data Preparation}
 
-For a sentence
-\begin{equation}
-S=(w_1,w_2,\ldots,w_n),
-\end{equation}
-the clause annotations are converted into binary boundary labels
-\begin{equation}
-Y=(y_1,y_2,\ldots,y_n), \qquad y_i\in{0,1}.
-\end{equation}
-The annotated boundaries are aligned with BERT subword tokens through character offsets so that WordPiece tokenization does not shift the boundary labels.
+The clause boundary predictor is trained using the English HCA corpus (\texttt{eng.hca.amr}) provided by HCASeg \cite{yu2023}. The corpus is annotated for clause-level segmentation and is distributed in CoNLL-U format, with clause boundaries indicated by \texttt{BeginSeg=Yes} in the \texttt{MISC} field. We use the original training, development, and test partitions supplied with the dataset.
 
-\subsection{Contextual Representation and Boundary Prediction}
+After preprocessing, the training, validation, and test sets contain 17,885, 740, and 751 sentences, respectively. The corresponding average sentence lengths are 24.59, 27.51, and 28.39 words. The average clause length is 8.44 words in the training set, 9.31 words in the validation set, and 9.23 words in the test set. The distribution of clause lengths in the training set is concentrated primarily between 3 and 12 words, with shorter clauses occurring less frequently and a smaller number of clauses exceeding 20 words.
 
-For each sentence, \texttt{bert-base-uncased} produces contextual token representations $h_i\in\mathbb{R}^{768}$. We mean-pool these representations to obtain a sentence-level representation and concatenate it with each token representation:
+The boundary labels are converted into a binary sequence for each sentence. The training set contains 34,873 boundary positions and 447,017 non-boundary positions, corresponding to approximately 7.8\% boundary tokens. The validation and test sets contain 1,482 and 1,599 boundary positions, respectively. This distribution results in a substantially larger number of non-boundary than boundary positions, which is considered when evaluating the boundary prediction model.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\columnwidth]{Clause_lenght_distribution.png}
+\caption{Distribution of clause lengths in the HCA training set.}
+\label{fig:clause_length_distribution}
+\end{figure}
+
+Because the annotations are defined over the original tokenization while the model uses BERT WordPiece tokenization, the clause boundary labels are aligned with the resulting subword tokens using character offsets. This prevents subword tokenization from shifting the annotated boundary positions. Padding positions introduced during batching are excluded from the training loss and evaluation.
+
+\subsection{Contextual Representation and Model Architecture}
+
+The segmentation model uses \texttt{bert-base-uncased} to obtain contextual representations for the input tokens. For each token position $i$, BERT produces a representation $h_i\in\mathbb{R}^{768}$. We additionally compute a sentence-level representation by mean-pooling the token representations. Let this representation be $h_S\in\mathbb{R}^{768}$. The sentence representation is concatenated with every token representation:
 
 \begin{equation}
 x_i=[h_i;h_S]\in\mathbb{R}^{1536}.
 \end{equation}
 
-Sequences are limited to 512 BERT tokens. The concatenated representations are projected to 384 dimensions and passed through a four-layer Transformer encoder with four attention heads, a feed-forward dimension of 1536, and dropout of 0.2:
+Providing the sentence-level representation alongside the token representation gives the boundary predictor access to both local contextual information and information about the sentence as a whole.
 
-\begin{equation}
-z_i=W_px_i+b_p.
-\end{equation}
+The resulting sequence of representations is projected from 1536 to 384 dimensions and passed through a four-layer Transformer encoder with four attention heads, a feed-forward dimension of 1536, and dropout of 0.2. The projection is given by $z_i=W_px_i+b_p$, where $W_p\in\mathbb{R}^{384\times1536}$ and $b_p\in\mathbb{R}^{384}$. The resulting contextual representations are then used by a linear prediction layer to estimate the likelihood that each token marks a clause boundary. The complete architecture and information flow of the module are shown in Fig.~\ref{fig:clause_architecture}.
 
-A linear layer produces a boundary logit $l_i$, which is converted to a probability with the sigmoid function. We predict a boundary when
-
-\begin{equation}
-\hat{y}_i=
-\begin{cases}
-1, & p_i>\tau,\\
-0, & p_i\leq\tau.
-\end{cases}
-\end{equation}
-
-A threshold of $\tau=0.39$ is selected by validation-based calibration.
-
-\subsection{Training Objective}
-
-We use binary cross-entropy for boundary prediction, excluding padding positions from the loss. The model is trained with AdamW using a learning rate of $10^{-4}$, batch size 4, and up to 30 epochs. We retain the checkpoint with the lowest development loss.
-
-Validation threshold calibration is applied after training to select the decision threshold used at test time.
-
-\subsection{Clause Reconstruction and Post-Processing}
-
-During inference, the predicted boundaries are combined with the BERT tokens to reconstruct contiguous clauses. Clauses containing tokens with \texttt{\#\#} are removed. The remaining tokens are grouped until a predicted boundary is reached, producing the ordered clause sequence
-
-\begin{equation}
-C=(c_1,c_2,\ldots,c_k).
-\end{equation}
-
-A lightweight post-processing step is then applied to make the reconstructed clauses linguistically usable. We remove WordPiece markers, merge contractions, and normalize spacing around punctuation, slashes, and hyphens. Punctuation-only segments are attached to adjacent clauses, while single-word segments are merged with neighboring clauses.
-
-Finally, clauses containing fewer than four whitespace-delimited tokens are merged iteratively with an adjacent clause. A short first or last clause is merged with its only neighbor. For an intermediate short clause, we merge it with the smaller neighboring clause unless the left neighbor ends with a period, in which case it is merged with the right neighbor. The resulting clause sequence is then passed to the memory-ranking module.
-
-\subsection{Architecture}
-
-The complete training and inference architecture of the clause segmentation module is shown in Fig.~\ref{fig:clause_architecture}.
-
-\begin{figure}[!t]
+\begin{figure}[H]
 \centering
-\includegraphics[width=\columnwidth,height=1.90in,keepaspectratio]{Fig2.png}
+\includegraphics[width=\columnwidth,height=2.5in,keepaspectratio]{Fig2.png}
 \caption{Training and inference architecture of the clause segmentation module.}
 \label{fig:clause_architecture}
 \end{figure}
 
+\subsection{Boundary Prediction and Training}
+
+For each token representation $z_i$, a linear layer produces a boundary logit $l_i$. The logit is converted into a boundary probability using the sigmoid function. A token is predicted to mark the beginning of a clause when its probability exceeds a decision threshold $\tau$. The model is trained using binary cross-entropy over the non-padding token positions. AdamW is used as the optimizer with a learning rate of $10^{-4}$ and a batch size of 4. Training is performed for up to 30 epochs, with the checkpoint achieving the lowest development-set loss retained for evaluation.
+
+The decision threshold is calibrated separately after training using the development set. A threshold of $\tau=0.39$ is selected and subsequently fixed for test-set evaluation and inference.
+
+\subsection{Clause Reconstruction and Post-Processing}
+
+The predicted boundary sequence is converted into an ordered clause sequence $C=(c_1,c_2,\ldots,c_k)$ by grouping consecutive tokens between predicted boundaries. Each clause is then processed as follows:
+
+\begin{itemize}
+\item \textbf{Merge WordPiece subwords:} remove the continuation marker \texttt{\#\#}.
+\item \textbf{Normalize text:} remove spaces before punctuation, around slashes and hyphens, and inside contractions.
+\item \textbf{Attach punctuation fragments:} merge punctuation-only clauses, such as \texttt{,} or \texttt{.}, with the preceding clause.
+\item \textbf{Merge isolated words:} append a single-word fragment to the preceding clause.
+\item \textbf{Remove short fragments:} repeatedly merge clauses containing fewer than four whitespace-delimited tokens. A short first or last clause is merged with its only neighbor.
+\item \textbf{Resolve intermediate fragments:} merge a short clause with the smaller neighboring clause, except when the left neighbor ends in a period; in that case, merge it with the right neighbor.
+\end{itemize}
+
+The resulting clauses are contiguous, readable, and passed to the Memory Ranker for clause-level memory-retention analysis.
+
+\subsection{Qualitative Segmentation Example}
+
+As a qualitative example, we apply the trained segmenter to an excerpt from a narrative describing a visit to the Los Angeles Zoo:
+
+\begin{quote}
+\footnotesize
+\textit{Me and my girlfriend had gone to the Los Angeles Zoo. I can't exactly remember the day but I believe it was either April or May or maybe June. It was a hot day and a spur-of-the-moment trip. When we walked in, there was the insect/reptile section of the zoo, so we saw many exotic-looking spiders, snakes, and scorpions. Then we walked in the African animals section and saw elephants.}
+\end{quote}
+
+The corresponding reconstructed clauses are:
+
+\begin{quote}
+\footnotesize
+\textit{[1] me and my girlfriend had gone to the los angeles zoo.}\\
+\textit{[2] i can't exactly remember the day but i believe}\\
+\textit{[3] it was either april or may or maybe june.}\\
+\textit{[4] it was a hot day that day and it was spur of the moment trip.}\\
+\textit{[5] when we walked in}\\
+\textit{[6] there was the insect/reptile section of the zoo}\\
+\textit{[7] so we saw many exotic looking spiders, snakes, scorpions etc.}\\
+\textit{[8] then we walked in the african animals section.}\\
+\textit{[9] we saw elephants mostly}\\
+\end{quote}
+
+The example illustrates how the model separates temporal, descriptive, and event-related propositions while retaining their original order. The resulting clause sequence can subsequently be embedded and scored by the Memory Ranker.
+.
 
 \section{Memory Ranking Module}
 
-After segmentation, the next module estimates the relative memorability of individual clauses using narrative recall data.
+After segmentation, the memory ranker module estimates the relative memorability of individual clauses using Breithaupt narrative recall data.
 
 \subsection{Narrative Recall Data}
 
@@ -210,7 +227,7 @@ denote the clauses in retelling $g$, where $g\in\{1,2,3\}$.
 
 \subsection{Clause-Level Recall Matching}
 
-Each clause is represented by a normalized 768-dimensional \texttt{all-mpnet-base-v2} embedding. For an original clause $c^{(o)}_i$, we compute cosine similarity against the clauses in each retelling, and the strongest match becomes the retelling-level score:
+Each clause is represented by a normalized 768-dimensional \texttt{all-mpnet-base-v2} embedding. For an original clause $c^{(o)}_i$, we compute cosine similarity against each clause in each retelling, and the strongest match becomes the retelling-level score:
 
 \begin{equation}
 r_i^{(g)}
@@ -220,33 +237,29 @@ r_i^{(g)}
 
 where $e_i$ and $e_j^{(g)}$ are normalized clause embeddings.
 
-The three retelling scores are summed:
+Then the three retelling scores are summed:
 
 \begin{equation}
 r_i =
 \sum_{g=1}^{3}r_i^{(g)}.
 \end{equation}
 
-A clause therefore receives a higher score when its content is reflected in the human retellings. The implementation also computes normalized source-clause centrality for inspection, but does not use it in the training target. The centrality score for a story with more than one clause is
-\begin{equation}
-a_i=\frac{1}{N-1}\sum_{j\ne i}e_i^\mathsf{T}e_j.
-\end{equation}
-For a single-clause story, centrality is set to one. The retelling-only target is min--max normalized within each story, as described next; if all retelling scores are equal, the target is set to 0.5 for every clause. No centrality/retelling mixture or clipping operation is used by the current data-preparation script.
+A clause therefore receives a higher score when its content is reflected in the human retellings. 
 
 \subsection{Within-Story Normalization}
 
-The goal is to compare clauses within each story rather than compare absolute scores across different stories. The retelling scores are min--max normalized within each story. For a story with target range $[r_{\min},r_{\max}]$, the normalized score is
-
-\begin{equation}
-m_i =
-\frac{r_i-r_{\min}}{r_{\max}-r_{\min}},
-\end{equation}
-
-If a story contains only one clause, or all clauses have the same score, every clause is assigned the neutral target value $0.5$.
+The goal is to compare clauses within each story rather than compare absolute scores across different stories. The retelling scores are min--max normalized within each story. If a story contains only one clause, or all clauses have the same score, every clause is assigned the neutral target value $0.5$.
 
 This normalization preserves the within-story ordering while reducing the influence of differences in the absolute embedding-similarity scale.
 
 \subsection{Transformer-Based Memory Ranker}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth,height=2.2in,keepaspectratio]{Fig3.png}
+\caption{Training and inference pipeline of the Memory Ranking Module.}
+\label{fig:memory_ranker}
+\end{figure}
 
 The normalized retelling scores are used as targets for a Transformer-based Memory Ranker. Each 768-dimensional clause embedding $x_i$ is first projected into a 256-dimensional hidden space:
 
@@ -264,38 +277,34 @@ Because the primary goal is relative ranking within a story, the training object
 \mathcal{L}=0.5\mathcal{L}_{\mathrm{BCE}}+0.5\mathcal{L}_{\mathrm{rank}},
 \end{equation}
 
-where the pointwise term is binary cross-entropy with logits, and, for unequal target scores, the pairwise term uses margin 0.2:
-
-\begin{equation}
-\ell_{ij}=\max\left(0,0.2-\operatorname{sign}(m_i-m_j)(\hat{s}_i-\hat{s}_j)\right).
-\end{equation}
-
-The pairwise losses are averaged within each story and then across the batch. Variable-length stories are padded and passed with a key-padding mask; tied target pairs are excluded from the ranking loss. Sigmoid is applied to raw model logits for probability-scale inference, not in the pairwise loss.
+where the pointwise term is binary cross-entropy with logits, and, for unequal target scores, the pairwise term uses margin 0.2. The pairwise losses are averaged within each story and then across the batch. Variable-length stories are padded and passed with a key-padding mask; tied target pairs are excluded from the ranking loss. Sigmoid is applied to raw model logits for probability-scale inference, not in the pairwise loss.
 
 \subsection{Training and Evaluation}
 
-The Memory Ranker is trained with AdamW at a learning rate of $10^{-4}$, batch size 8, and a maximum of 50 epochs. A ReduceLROnPlateau scheduler halves the learning rate after two non-improving validation epochs, down to a minimum of $10^{-6}$. Stories are shuffled deterministically using seed 42 and split by story into 70\% training, 10\% validation, and the remaining test set (integer truncation determines the exact counts). Early stopping monitors validation loss with patience 10, and the lowest-loss checkpoint is saved.
+The Memory Ranker is trained with AdamW at a learning rate of $10^{-4}$, batch size 8, and a maximum of 50 epochs. A ReduceLROnPlateau scheduler halves the learning rate after two non-improving validation epochs, down to a minimum of $10^{-6}$. Stories are shuffled deterministically using seed 42 and split by story into 70\% training, 10\% validation, and the remaining test set (integer truncation determines the exact counts). Early stopping monitors validation loss with patience of epochs, and the lowest validation loss checkpoint is saved.
 
-For evaluation, we use the independent human-memory dataset reported by Georgiou et al. \cite{georgiou2025}, which provides human-derived clause recall probabilities. Because the benchmark is small, it is used only for evaluation. We compare predicted memorability with human recall using MAE, RMSE, Spearman correlation, Kendall's $\tau$, pairwise ranking accuracy, NDCG@1, NDCG@3, NDCG@5, and top-5 overlap. Metrics are computed separately for each story and then averaged across stories. The comparison includes random ranking, clause position, and MPNet embedding similarity computed from the same normalized representation.
+\subsection{Qualitative Ranking Example}
 
-\subsection{Target-Ratio Ablation}
+The following lines show the predicted memory score for each clause in the segmentation example. Scores are the sigmoid outputs of the Memory Ranker.
 
-The current data-preparation script trains on the retelling-only target and does not implement the earlier centrality--retelling ratio sweep. The sweep values and associated figures are therefore omitted from the current experimental claims. Centrality is computed and retained as a diagnostic field, but a controlled ablation would require regenerating targets, retraining each configuration, and evaluating each resulting checkpoint with the same protocol.
-
-\subsection{Memory Ranking Pipeline}
-
-Fig.~\ref{fig:memory_ranker} summarizes the training and inference pipeline of the Memory Ranking Module.
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth,height=1.90in,keepaspectratio]{Fig3.png}
-\caption{Training and inference pipeline of the Memory Ranking Module.}
-\label{fig:memory_ranker}
-\end{figure}
+\begin{quote}
+\footnotesize
+\begin{tabular}{@{}p{0.9\linewidth}@{\quad}r@{}}
+\textit{[1] me and my girlfriend had gone to the los angeles zoo.} & \textit{0.6248}\\
+\textit{[2] i can't exactly remember the day but i believe} & \textit{0.4792}\\
+\textit{[3] it was either april or may or maybe june.} & \textit{0.5117}\\
+\textit{[4] it was a hot day that day and it was spur of the moment trip.} & \textit{0.5132}\\
+\textit{[5] when we walked in} & \textit{0.5062}\\
+\textit{[6] there was the insect/reptile section of the zoo} & \textit{0.5378}\\
+\textit{[7] so we saw many exotic looking spiders, snakes, scorpions etc.} & \textit{0.5002}\\
+\textit{[8] then we walked in the african animals section.} & \textit{0.4134}\\
+\textit{[9] we saw elephants mostly} & \textit{0.4619}
+\end{tabular}
+\end{quote}
 
 \section{Reinforcement Learning Pipeline}
 
-The intended RL reward is restricted to three components: (1) a Memory Ranker score for memorability, (2) a BERT-based semantic-preservation score comparing the source target clause with its rewrite, and (3) a length constraint. There is no semantic-centrality reward or separate information-fidelity reward. The current trainer provides a GRPO experiment for rewriting one target clause in its surrounding clause context, but currently implements only the Memory Ranker component and the length constraint; the BERT-based semantic-preservation reward is planned, not yet implemented. The training data are produced from 50-word windows with stride 50. The existing clause segmenter and Memory Ranker score each window; interior clauses are selected in center-out order as target examples. The prompt instructs the model to preserve the target meaning, avoid adding information or borrowing from other clauses, produce one sentence, and stay within 150\% of the original target's word count. Up to 1,500 valid examples are selected using seed 42 by default; the preprocessing pipeline does not define train/validation/test partitions.
+The intended RL reward is restricted to three components: (1) a Memory Ranker score for memorability, (2) a BERT-based semantic-preservation score comparing the source target clause with its rewrite, and (3) a length constraint. The training data are produced from 50-word windows with stride 50. The existing clause segmenter and Memory Ranker score each window; interior clauses are selected in center-out order as target examples. The prompt instructs the model to preserve the target meaning, avoid adding information or borrowing from other clauses, produce one sentence, and stay within 150\% of the original target's word count. Up to 20,000 valid examples are selected using seed 42 by default.
 
 The policy is the local Qwen2.5-0.5B-Instruct model, trained for one epoch with TRL's GRPO trainer. The run uses 4-bit NF4 quantization with double quantization, FP16 computation, and LoRA adapters (rank 8, alpha 16, dropout 0.05) on the query, key, value, and output projections. The per-device batch size is 2, gradient accumulation is 8, four completions are sampled per prompt, the learning rate is $5\times10^{-6}$, and the maximum prompt and completion lengths are 256 and 48 tokens. The saved run contains 5,000 training steps and reaches epoch 1.
 
@@ -309,78 +318,15 @@ R=\begin{cases}
 \end{equation}
 Thus valid pairwise score differences lie in $[-1,1]$, while completions exceeding the 150\% word-count cap receive a rejection penalty plus an excess-length penalty and a small ranker-score contribution. The BERT-based semantic-preservation score will be added to this implemented ranker-and-length reward; it is not reflected in the checkpoint's training objective. In the intended three-component objective, the final reward will combine these ranker, BERT-semantic, and length-constraint signals, with no additional centrality or information-fidelity term.
 
-The checkpoint and trainer log establish that optimization ran, but are not evidence of improved retention, semantic preservation, or overall rewrite quality. The available comparison utility supports qualitative base-model versus adapter generations with ranker scoring; no held-out quantitative evaluation of the GRPO outputs is currently provided. Integrating the BERT-based reward and evaluating the complete three-component objective remain future work.
-
 \section{Experiments}
 
-\subsection{Experimental Setup}
-
-The experiments report held-out clause segmentation results and Memory Ranker performance on 13 independent stories with human clause-recall probabilities, using MAE, RMSE, Spearman correlation, Kendall's $\tau$, pairwise accuracy, NDCG@1/3/5, and top-5 overlap. The Memory Ranker is compared with random ranking, clause position, and MPNet embedding similarity. GRPO training has also been run and produced a saved adapter checkpoint, but the present study does not report a controlled quantitative evaluation of its generated rewrites or reader retention.
-
-\subsection{GRPO Training Run}
-
-The GRPO experiment was designed as a controlled first test of whether a memorability-guided reward produces observable changes in a small instruction-tuned policy. The raw fine-tuning data were converted to CSV, and rows containing fewer than 50 whitespace-delimited words were removed. Each remaining text was divided into non-overlapping 50-word windows using a stride of 50. The clause segmenter and Memory Ranker were then applied to each window. Windows with fewer than three clauses were discarded, and the remaining interior clauses were selected in center-out order as target clauses. Each target produced one training example containing the ordered clause context, the target marker, the original target text, and its Memory Ranker score. This procedure generated 198,800 validatable examples in the stored preprocessing artifact.
-
-The trainer used a deterministic sample of 20,000 examples from these rows, selected with seed 42. This cap was chosen because the purpose of this run was to establish whether the reward and prompting scheme could produce measurable behavioral changes, rather than to maximize corpus coverage or claim dataset-size saturation. Using more windows was therefore not necessary for this initial diagnostic experiment and would have increased compute and training time without changing the question being tested. The 20,000 examples were used for the single training run; the preprocessing and trainer do not define a held-out validation or test partition, so the run cannot support generalization claims.
-
-Each prompt asked the policy to rewrite only the marked target clause, preserve its meaning, avoid information from neighboring clauses, produce one sentence, and remain within 150\% of the original target's word count. The local Qwen2.5-0.5B-Instruct model was loaded with 4-bit NF4 double-quantized weights and FP16 computation. LoRA was applied to the query, key, value, and output projections with rank 8, alpha 16, and dropout 0.05. TRL's GRPO configuration used a per-device batch size of 2, gradient accumulation of 8, four sampled completions per prompt, one epoch, a learning rate of $5\times10^{-6}$, gradient checkpointing, and a maximum completion length of 48 tokens. The maximum prompt length was 256 tokens. No external experiment tracker was used; metrics were written to the trainer log.
-
-The implemented reward uses the Memory Ranker score change for the target clause and a length constraint. If $s_o$ and $s_w$ are the ranker scores for the original and rewritten target in the same clause context, the score contribution is $\Delta=s_w-s_o$. Empty outputs receive a fixed penalty of $-2.5$. Rewrites within the 150\% word-count limit receive $\Delta$; longer rewrites receive a rejection penalty, an excess-length penalty, and a reduced $0.25\Delta$ contribution. The BERT-based semantic-preservation term described in the intended objective was not present in this run. Consequently, the run tests ranker-guided rewriting under a length constraint, not the complete three-component objective.
-
-The logged run completed one epoch in approximately $27{,}250$ seconds, corresponding to 5,000 training steps. The final trainer summary reports a training loss of 0.06289, while the last logged interval reports a reward mean of approximately $-0.184$, reward standard deviation 0.265, mean completion length 10.88 tokens, and clipped-completion ratio 0.0125. These values describe the optimization trajectory and sampling behavior only. In particular, the negative reward scale is expected under the implemented empty/overlength penalties and does not by itself imply failed learning. The run does not include held-out rewrite-quality, semantic-fidelity, or human-retention measurements.
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/loss_reward.png}
-\caption{GRPO loss and reward recorded during the 20,000-example training run.}
-\label{fig:grpo_loss_reward}
-\end{figure}
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/reward_statistics.png}
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/completion_lengths.png}
-\caption{Reward variability and generated completion lengths during GRPO training.}
-\label{fig:grpo_reward_lengths}
-\end{figure}
-
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/learning_rate.png}
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/entropy_gradient_norm.png}
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/clipped_ratio.png}
-\caption{Learning-rate decay, entropy and gradient-norm behavior, and completion clipping during the run.}
-\label{fig:grpo_training_diagnostics}
-\end{figure}
-
 \subsection{Clause Segmentation Results}
-
-Clause segmentation is evaluated using precision, recall, accuracy, and F1. The fixed-learning-rate configuration reaches a test F1 of 0.8153, while adding a learning-rate scheduler increases it to 0.8252.
-
-\begin{table}[t]
-\centering
-\caption{Clause segmentation performance under different configurations.}
-\label{tab:clause_results}
-\begin{tabular}{lcccc}
-\hline
-Configuration & Precision & Recall & Accuracy & F1 \\
-\hline
-Fixed LR, $\tau=0.50$ & 0.7808 & 0.8530 & 0.9737 & 0.8153 \\
-LR Scheduler, $\tau=0.50$ & 0.7900 & 0.8637 & 0.9751 & 0.8252 \\
-LR Scheduler, $\tau=0.39$ & \textbf{0.8481} & 0.8099 & \textbf{0.9772} & \textbf{0.8285} \\
-\hline
-\end{tabular}
-\end{table}
-
-\subsubsection{Learning Rate Scheduling}
-
-With the other settings unchanged, adding the learning-rate scheduler increases test F1 from 0.8153 to 0.8252. This improvement suggests better generalization than the fixed-learning-rate setting.
 
 \subsubsection{Decision Threshold Calibration}
 
 We tune the decision threshold on the validation set over 0.10--0.90 in steps of 0.01. The best validation F1 occurs at $\tau=0.39$, giving F1 = 0.8487, precision = 0.8632, recall = 0.8347, and accuracy = 0.9804.
 
-\begin{figure}[!t]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\columnwidth,height=1.80in,keepaspectratio]{Fig_Threshold_F1.png}
 \caption{Validation F1 across decision thresholds; the selected threshold is $\tau=0.39$.}
@@ -388,6 +334,27 @@ We tune the decision threshold on the validation set over 0.10--0.90 in steps of
 \end{figure}
 
 We then fix this threshold and apply it to the held-out test set. The resulting precision is 0.8481, recall 0.8099, accuracy 0.9772, and F1 0.8285. Relative to the default threshold of 0.50, calibration improves precision and gives a modest F1 gain.
+
+\subsubsection{Positive-Class Weight Ablation}
+
+Because clause boundaries are a minority class in the HCA corpus (approximately 7.8\% of labels), we evaluated whether increasing the loss weight on boundary tokens improves separation between boundary and non-boundary positions. Table~\ref{tab:pos_weight_ablation} reports validation-set results for positive-class weights of 1, 2, 5, and 10 in the weighted BCE objective. The best overall model is obtained with the unweighted objective ($\texttt{pos\_weight}=1$), reaching F1 = 0.8510, precision = 0.8724, recall = 0.8306, and accuracy = 0.9808. Increasing the positive-class weight raises recall but lowers precision enough that F1 decreases; the highest recall occurs at $\texttt{pos\_weight}=5$ (0.8725), but at the cost of a substantially lower precision of 0.8001. These results suggest that the dataset imbalance is not severe enough to require aggressive reweighting, and the final segmentation setup therefore keeps the lower positive-class weight with the calibrated boundary threshold.
+
+\begin{table}[H]
+\centering
+\caption{Validation-set ablation for positive-class weighting in the clause-boundary loss.}
+\label{tab:pos_weight_ablation}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{cccccc}
+\hline
+\texttt{pos\_weight} & Best epoch & Precision & Recall & Accuracy & F1 \\
+\hline
+1 & 12 & 0.8724 & 0.8306 & 0.9808 & 0.8510 \\
+2 & 17 & 0.8484 & 0.8421 & 0.9797 & 0.8452 \\
+5 & 11 & 0.8001 & 0.8725 & 0.9772 & 0.8347 \\
+10 & 30 & 0.7958 & 0.8623 & 0.9763 & 0.8277 \\
+\hline
+\end{tabular}}
+\end{table}
 
 \subsection{Memory Ranking Results}
 
@@ -439,6 +406,49 @@ Figures~\ref{fig:ranking_metrics}--\ref{fig:error_metrics} summarize the ranking
 \caption{Prediction error relative to human clause-recall probabilities.}
 \label{fig:error_metrics}
 \end{figure}
+
+
+\subsection{GRPO Training Run}
+
+The GRPO experiment was designed as a controlled first test of whether a memorability-guided reward produces observable changes in a small instruction-tuned policy. The raw fine-tuning data were converted to CSV, and rows containing fewer than 50 whitespace-delimited words were removed. Each remaining text was divided into non-overlapping 50-word windows using a stride of 50. The clause segmenter and Memory Ranker were then applied to each window. Windows with fewer than three clauses were discarded, and the remaining interior clauses were selected in center-out order as target clauses. Each target produced one training example containing the ordered clause context, the target marker, the original target text, and its Memory Ranker score. This procedure generated 198,800 validatable examples in the stored preprocessing artifact.
+
+The trainer used a deterministic sample of 20,000 examples from these rows, selected with seed 42. This cap was chosen because the purpose of this run was to establish whether the reward and prompting scheme could produce measurable behavioral changes, rather than to maximize corpus coverage or claim dataset-size saturation. Using more windows was therefore not necessary for this initial diagnostic experiment and would have increased compute and training time without changing the question being tested. The 20,000 examples were used for the single training run; the preprocessing and trainer do not define a held-out validation or test partition, so the run cannot support generalization claims.
+
+Each prompt asked the policy to rewrite only the marked target clause, preserve its meaning, avoid information from neighboring clauses, produce one sentence, and remain within 150\% of the original target's word count. The local Qwen2.5-0.5B-Instruct model was loaded with 4-bit NF4 double-quantized weights and FP16 computation. LoRA was applied to the query, key, value, and output projections with rank 8, alpha 16, and dropout 0.05. TRL's GRPO configuration used a per-device batch size of 2, gradient accumulation of 8, four sampled completions per prompt, one epoch, a learning rate of $5\times10^{-6}$, gradient checkpointing, and a maximum completion length of 48 tokens. The maximum prompt length was 256 tokens. No external experiment tracker was used; metrics were written to the trainer log.
+
+The implemented reward uses the Memory Ranker score change for the target clause and a length constraint. If $s_o$ and $s_w$ are the ranker scores for the original and rewritten target in the same clause context, the score contribution is $\Delta=s_w-s_o$. Empty outputs receive a fixed penalty of $-2.5$. Rewrites within the 150\% word-count limit receive $\Delta$; longer rewrites receive a rejection penalty, an excess-length penalty, and a reduced $0.25\Delta$ contribution. The BERT-based semantic-preservation term described in the intended objective was not present in this run. Consequently, the run tests ranker-guided rewriting under a length constraint, not the complete three-component objective.
+
+The logged run completed one epoch in approximately $27{,}250$ seconds, corresponding to 5,000 training steps. The final trainer summary reports a training loss of 0.06289, while the last logged interval reports a reward mean of approximately $-0.184$, reward standard deviation 0.265, mean completion length 10.88 tokens, and clipped-completion ratio 0.0125. These values describe the optimization trajectory and sampling behavior only. In particular, the negative reward scale is expected under the implemented empty/overlength penalties and does not by itself imply failed learning. The run does not include held-out rewrite-quality, semantic-fidelity, or human-retention measurements.
+
+\IfFileExists{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/loss_reward.png}{%
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/loss_reward.png}
+\caption{GRPO loss and reward recorded during the 20,000-example training run.}
+\label{fig:grpo_loss_reward}
+\end{figure}
+}{}
+
+\IfFileExists{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/reward_statistics.png}{%
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth,height=1.05in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/reward_statistics.png}
+\includegraphics[width=\columnwidth,height=1.05in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/completion_lengths.png}
+\caption{Reward variability and generated completion lengths during GRPO training.}
+\label{fig:grpo_reward_lengths}
+\end{figure}
+}{}
+
+\IfFileExists{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/learning_rate.png}{%
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth,height=0.70in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/learning_rate.png}
+\includegraphics[width=\columnwidth,height=0.70in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/entropy_gradient_norm.png}
+\includegraphics[width=\columnwidth,height=0.70in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/clipped_ratio.png}
+\caption{Learning-rate decay, entropy and gradient-norm behavior, and completion clipping during the run.}
+\label{fig:grpo_training_diagnostics}
+\end{figure}
+}{}
 
 
 \section{Discussion}
@@ -568,7 +578,8 @@ in \emph{Second Conference on Language Modeling},
 
 \bibitem{roit2023}
 P. Roit et al.,
-``Factually Consistent Summarization via Reinforcement Learning with Textual Entailment Feedback,''
+``Factually Consistent Summarization via Reinforce
+ment Learning with Textual Entailment Feedback,''
 in \emph{Proc. ACL},
 2023.
 

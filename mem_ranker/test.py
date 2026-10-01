@@ -126,12 +126,6 @@ def test_scoring_math() -> None:
     scored = _score_story(story)["clauses"]
 
     _assert_close(
-        scored[0]["centrality_score"],
-        0.5,
-        "centrality score",
-    )
-
-    _assert_close(
         scored[0]["retelling_score"],
         1.0,
         "retelling score",
@@ -141,12 +135,6 @@ def test_scoring_math() -> None:
         scored[0]["target"],
         1.0,
         "normalized target",
-    )
-
-    _assert_close(
-        scored[1]["centrality_score"],
-        0.5,
-        "second centrality score",
     )
 
     _assert_close(

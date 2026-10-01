@@ -5,7 +5,13 @@ __pycache__
 
 
 Clause_Seg/data_pipeline/optimized_data/
-mem_ranker/data_pipeline
+Clause_Seg/models
+
+mem_ranker/data_pipeline/optimized_data
+mem_ranker/data_pipeline/models
+mem_ranker/data_pipeline/Embedded_dataset
+
+
 fine_tuning/data_pipeline
 fine_tuning/models
 fine_tuning/outputs
