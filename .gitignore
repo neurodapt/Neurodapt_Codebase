@@ -1,0 +1,9 @@
+.venv
+__pycache__
+.pytest_cache
+.uv-cache-check
+
+
+Clause_Seg/data_pipeline/optimized_data/
+fine_tuning
+mem_ranker
