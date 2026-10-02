@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import random
 from pathlib import Path
 
@@ -12,18 +13,14 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from model import MemoryRanker
-from plot import (
-    LOSS_PLOT_PATH,
-    create_live_loss_plot,
-    save_loss_plot,
-    update_live_loss_plot,
-)
+from plot import save_loss_plot
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "data_pipeline" / "optimized_data"
-TRAIN_PATH = DATA_DIR / "train_optimized.pt"
-VALIDATION_PATH = DATA_DIR / "validation_optimized.pt"
-MODEL_PATH = PROJECT_DIR / "memory_ranker_model_best.pt"
+EMBEDDING_MODEL_NAMES = (
+    "all_mpnet_base_v2",
+    "minilm",
+    "bert_base_uncased",
+)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
@@ -163,13 +160,21 @@ def run_epoch(
     return total_loss / len(loader)
 
 
-def main() -> None:
-    seed_everything()
-    print(f"Seed: {SEED}")
-    print(f"Using device: {DEVICE}")
+def train_model(embedding_model_name: str) -> None:
+    data_dir = PROJECT_DIR / "data_pipeline" / "optimized_data" / embedding_model_name
+    train_path = data_dir / "train_optimized.pt"
+    validation_path = data_dir / "validation_optimized.pt"
+    output_dir = PROJECT_DIR / "models" / embedding_model_name
+    model_path = output_dir / "memory_ranker_model_best.pt"
+    loss_plot_path = output_dir / "training_loss.png"
 
-    train_dataset = MemoryRankerDataset(TRAIN_PATH)
-    validation_dataset = MemoryRankerDataset(VALIDATION_PATH)
+    seed_everything()
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Seed: {SEED}")
+    print(f"Training {embedding_model_name} on device: {DEVICE}")
+
+    train_dataset = MemoryRankerDataset(train_path)
+    validation_dataset = MemoryRankerDataset(validation_path)
     if train_dataset.embedding_dim != validation_dataset.embedding_dim:
         raise ValueError("Train and validation embedding dimensions do not match")
 
@@ -199,7 +204,6 @@ def main() -> None:
     epochs_without_improvement = 0
     training_losses = []
     validation_losses = []
-    live_loss_plot = create_live_loss_plot()
 
     for epoch in range(EPOCHS):
         training_loss = run_epoch(model, train_loader, optimizer)
@@ -214,31 +218,37 @@ def main() -> None:
             f"Validation Loss: {validation_loss:.4f} | "
             f"LR: {current_lr:.2e}"
         )
-        update_live_loss_plot(
-            live_loss_plot,
-            training_losses,
-            validation_losses,
-        )
 
         if validation_loss < best_validation_loss:
             best_validation_loss = validation_loss
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), MODEL_PATH)
-            print(f"Saved best model to {MODEL_PATH}")
+            torch.save(model.state_dict(), model_path)
+            print(f"Saved best model to {model_path}")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
                 print(f"Early stopping after {epoch + 1} epochs")
                 break
 
-    save_loss_plot(training_losses, validation_losses)
-    if live_loss_plot is not None:
-        import matplotlib.pyplot as plt
+    save_loss_plot(training_losses, validation_losses, loss_plot_path)
+    print(f"Saved loss plot to {loss_plot_path}")
 
-        plt.ioff()
-        plt.close(live_loss_plot[0])
-    print(f"Saved loss plot to {LOSS_PLOT_PATH}")
+
+def main(model_name: str | None = None) -> None:
+    model_names = (model_name,) if model_name else EMBEDDING_MODEL_NAMES
+    for name in model_names:
+        if name not in EMBEDDING_MODEL_NAMES:
+            raise ValueError(f"Unknown embedding model: {name}")
+        train_model(name)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train MemoryRanker models.")
+    parser.add_argument(
+        "--model",
+        choices=("all",) + EMBEDDING_MODEL_NAMES,
+        default="all",
+        help="Model to train, or all three models (default).",
+    )
+    args = parser.parse_args()
+    main(None if args.model == "all" else args.model)

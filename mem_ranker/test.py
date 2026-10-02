@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import sys
 
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
+from scipy.stats import kendalltau, spearmanr
+from sklearn.metrics import ndcg_score
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "data_pipeline" / "optimized_data"
-TEST_PATH = DATA_DIR / "test_optimized.pt"
-MODEL_PATH = PROJECT_DIR / "memory_ranker_model_best.pt"
-EXPECTED_EMBEDDING_DIMENSION = 768
+EMBEDDING_MODEL_NAMES = (
+    "all_mpnet_base_v2",
+    "minilm",
+    "bert_base_uncased",
+)
+DEFAULT_EMBEDDING_MODEL = "all_mpnet_base_v2"
 SPLIT_NAMES = ("train", "validation", "test")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -24,11 +28,22 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from data_pipeline.optimized_data import _score_story, _split_stories
+from data_pipeline.embedding import EmbeddingModels
 from model import MemoryRanker
 
 
 BATCH_SIZE = 8
-EMBEDDING_MODEL_PATH = PROJECT_DIR / "data_pipeline" / "models" / "all_mpnet_base_v2"
+
+
+def _model_paths(embedding_model_name: str) -> tuple[Path, Path, Path]:
+    data_dir = (
+        PROJECT_DIR / "data_pipeline" / "optimized_data" / embedding_model_name
+    )
+    test_path = data_dir / "test_optimized.pt"
+    model_path = (
+        PROJECT_DIR / "models" / embedding_model_name / "memory_ranker_model_best.pt"
+    )
+    return data_dir, test_path, model_path
 
 MANUAL_STORIES = [
     {
@@ -162,10 +177,11 @@ def test_split_math() -> None:
         raise AssertionError("Story IDs overlap or are missing across splits")
 
 
-def test_saved_splits() -> None:
+def test_saved_splits(embedding_model_name: str = DEFAULT_EMBEDDING_MODEL) -> None:
+    data_dir, _, _ = _model_paths(embedding_model_name)
     split_data = {}
     for name in SPLIT_NAMES:
-        path = DATA_DIR / f"{name}_optimized.pt"
+        path = data_dir / f"{name}_optimized.pt"
         if not path.exists():
             raise AssertionError(
                 f"Missing {path}. Run data_pipeline/optimized_data.py first."
@@ -181,10 +197,6 @@ def test_saved_splits() -> None:
             if not story["clauses"]:
                 raise AssertionError(f"Story {story['story_id']} has no clauses")
             for clause in story["clauses"]:
-                if clause["embedding"].numel() != EXPECTED_EMBEDDING_DIMENSION:
-                    raise AssertionError(
-                        "A clause does not contain a 768-dimensional MPNet embedding"
-                    )
                 if not 0.0 <= clause["target"] <= 1.0:
                     raise AssertionError("A clause target is outside [0, 1]")
 
@@ -192,13 +204,55 @@ def test_saved_splits() -> None:
         raise AssertionError("Story IDs overlap across saved splits")
 
 
-def evaluate_model() -> dict[str, float]:
-    if not MODEL_PATH.exists():
+def _ranking_metrics(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+) -> dict[str, float]:
+    spearman = spearmanr(targets, predictions).statistic
+    kendall = kendalltau(targets, predictions).statistic
+    if not np.isfinite(spearman):
+        spearman = 0.0
+    if not np.isfinite(kendall):
+        kendall = 0.0
+
+    ndcg = {
+        f"ndcg@{cutoff}": float(
+            ndcg_score(
+                targets.reshape(1, -1),
+                predictions.reshape(1, -1),
+                k=cutoff,
+            )
+        )
+        for cutoff in (1, 3, 5)
+    }
+    return {
+        "spearman": float(spearman),
+        "kendall_tau": float(kendall),
+        **ndcg,
+    }
+
+
+def test_ranking_metrics() -> None:
+    targets = np.asarray([0.1, 0.4, 0.8, 0.2, 0.6])
+    perfect = _ranking_metrics(targets, targets)
+    reversed_metrics = _ranking_metrics(targets, targets[::-1])
+
+    for name in ("spearman", "kendall_tau", "ndcg@1", "ndcg@3", "ndcg@5"):
+        _assert_close(perfect[name], 1.0, f"perfect {name}")
+    _assert_close(reversed_metrics["spearman"], -1.0, "reversed spearman")
+    _assert_close(reversed_metrics["kendall_tau"], -1.0, "reversed Kendall tau")
+
+
+def evaluate_model(
+    embedding_model_name: str = DEFAULT_EMBEDDING_MODEL,
+) -> dict[str, float]:
+    _, test_path, model_path = _model_paths(embedding_model_name)
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"Model checkpoint not found: {MODEL_PATH}. Run train.py first."
+            f"Model checkpoint not found: {model_path}. Run train.py first."
         )
 
-    dataset = MemoryRankerDataset(TEST_PATH)
+    dataset = MemoryRankerDataset(test_path)
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -206,7 +260,7 @@ def evaluate_model() -> dict[str, float]:
         collate_fn=padding,
     )
     model = MemoryRanker(input_dim=dataset.embedding_dim).to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     model.eval()
 
     predictions = []
@@ -227,6 +281,7 @@ def evaluate_model() -> dict[str, float]:
     squared_error = (predicted - target) ** 2
     comparable = 0
     correct_order = 0
+    ranking_results = []
     for story in dataset.data:
         story_embeddings = torch.stack(
             [clause["embedding"] for clause in story["clauses"]]
@@ -237,6 +292,7 @@ def evaluate_model() -> dict[str, float]:
         )
         with torch.no_grad():
             story_predictions = torch.sigmoid(model(story_embeddings))[0].cpu().numpy()
+        ranking_results.append(_ranking_metrics(story_predictions, story_targets))
         for left in range(len(story_targets)):
             for right in range(left + 1, len(story_targets)):
                 target_difference = story_targets[left] - story_targets[right]
@@ -250,39 +306,37 @@ def evaluate_model() -> dict[str, float]:
     metrics = {
         "mae": float(absolute_error.mean()),
         "rmse": float(np.sqrt(squared_error.mean())),
+        "spearman": float(np.mean([result["spearman"] for result in ranking_results])),
+        "kendall_tau": float(
+            np.mean([result["kendall_tau"] for result in ranking_results])
+        ),
         "pairwise_accuracy": (
             float(correct_order / comparable) if comparable else 0.0
         ),
+        "ndcg@1": float(np.mean([result["ndcg@1"] for result in ranking_results])),
+        "ndcg@3": float(np.mean([result["ndcg@3"] for result in ranking_results])),
+        "ndcg@5": float(np.mean([result["ndcg@5"] for result in ranking_results])),
     }
     return metrics
 
 
-def manual_story_demo() -> None:
+def manual_story_demo(embedding_model_name: str = DEFAULT_EMBEDDING_MODEL) -> None:
     """Print model scores for a few hand-written stories."""
-    if not MODEL_PATH.exists():
+    _, _, model_path = _model_paths(embedding_model_name)
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"Model checkpoint not found: {MODEL_PATH}. Run train.py first."
-        )
-    if not EMBEDDING_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Embedding model not found: {EMBEDDING_MODEL_PATH}. "
-            "Run data_pipeline/embedding.py first."
+            f"Model checkpoint not found: {model_path}. Run train.py first."
         )
 
-    encoder = SentenceTransformer(str(EMBEDDING_MODEL_PATH), device=str(DEVICE))
-    model = MemoryRanker(input_dim=EXPECTED_EMBEDDING_DIMENSION).to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
+    encoder = EmbeddingModels(device=DEVICE)
+    model = MemoryRanker(input_dim=encoder.dimension(embedding_model_name)).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
     model.eval()
 
     print("\nManual story behavior:")
     for story in MANUAL_STORIES:
         embeddings = torch.from_numpy(
-            encoder.encode(
-                story["clauses"],
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
+            encoder.encode(embedding_model_name, story["clauses"])
         ).float().unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             scores = torch.sigmoid(model(embeddings))[0].cpu().tolist()
@@ -297,16 +351,28 @@ def manual_story_demo() -> None:
             print(f"  {rank}. {score:.4f} | {clause}")
 
 
-def main() -> None:
+def main(model_name: str | None = None) -> None:
     test_scoring_math()
     test_split_math()
-    test_saved_splits()
-    metrics = evaluate_model()
-    print("Test results:")
-    for name, value in metrics.items():
-        print(f"  {name}: {value:.4f}")
-    manual_story_demo()
+    model_names = (model_name,) if model_name else EMBEDDING_MODEL_NAMES
+    for name in model_names:
+        if name not in EMBEDDING_MODEL_NAMES:
+            raise ValueError(f"Unknown embedding model: {name}")
+        test_saved_splits(name)
+        metrics = evaluate_model(name)
+        print(f"Test results for {name}:")
+        for metric_name, value in metrics.items():
+            print(f"  {metric_name}: {value:.4f}")
+        manual_story_demo(name)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate MemoryRanker models.")
+    parser.add_argument(
+        "--model",
+        choices=("all",) + EMBEDDING_MODEL_NAMES,
+        default="all",
+        help="Model to test, or all three models (default).",
+    )
+    args = parser.parse_args()
+    main(None if args.model == "all" else args.model)

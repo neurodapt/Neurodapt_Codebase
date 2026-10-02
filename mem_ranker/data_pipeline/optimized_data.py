@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import random
 from pathlib import Path
 from typing import Any
@@ -9,14 +10,13 @@ from tqdm import tqdm
 
 
 HERE = Path(__file__).resolve().parent
-EMBEDDED_DATASET_PATH = HERE / "Embedded_dataset" / "embedded_stories_all_mpnet_base_v2.pt"
 OUTPUT_DIR = HERE / "optimized_data"
-
-SPLIT_PATHS = {
-    "train": OUTPUT_DIR / "train_optimized.pt",
-    "validation": OUTPUT_DIR / "validation_optimized.pt",
-    "test": OUTPUT_DIR / "test_optimized.pt",
-}
+EMBEDDING_MODEL_NAMES = (
+    "all_mpnet_base_v2",
+    "minilm",
+    "bert_base_uncased",
+)
+DEFAULT_EMBEDDING_MODEL = "all_mpnet_base_v2"
 
 SEED = 42
 random.seed(SEED)
@@ -101,11 +101,31 @@ def _split_stories(stories: list[dict[str, Any]]) -> dict[str, list[dict[str, An
     }
 
 
-def main() -> None:
-    if not EMBEDDED_DATASET_PATH.exists():
-        raise FileNotFoundError(f"Expected MPNet embeddings at {EMBEDDED_DATASET_PATH}. Run embedding.py first.")
+def _optimize_model(model_name: str) -> None:
+    if model_name not in EMBEDDING_MODEL_NAMES:
+        valid_models = ", ".join(EMBEDDING_MODEL_NAMES)
+        raise ValueError(f"Unknown embedding model: {model_name}. Choose one of: {valid_models}")
 
-    embedded_stories = torch.load(EMBEDDED_DATASET_PATH,map_location="cpu",weights_only=False)
+    embedded_dataset_path = (
+        HERE / "Embedded_dataset" / f"embedded_stories_{model_name}.pt"
+    )
+    model_output_dir = OUTPUT_DIR / model_name
+    split_paths = {
+        split: model_output_dir / f"{split}_optimized.pt"
+        for split in ("train", "validation", "test")
+    }
+
+    if not embedded_dataset_path.exists():
+        raise FileNotFoundError(
+            f"Expected {model_name} embeddings at {embedded_dataset_path}. "
+            "Run embedding.py first."
+        )
+
+    embedded_stories = torch.load(
+        embedded_dataset_path,
+        map_location="cpu",
+        weights_only=False,
+    )
 
     scored_stories = [
         _score_story(story)
@@ -118,13 +138,29 @@ def main() -> None:
 
     splits = _split_stories(scored_stories)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    model_output_dir.mkdir(parents=True, exist_ok=True)
 
     for name, stories in splits.items():
-        output_path = SPLIT_PATHS[name]
+        output_path = split_paths[name]
         torch.save(stories, output_path)
         print(f"Saved {len(stories)} {name} stories to {output_path}")
 
 
+def main(model_name: str | None = None) -> None:
+    model_names = (model_name,) if model_name else EMBEDDING_MODEL_NAMES
+    for name in model_names:
+        _optimize_model(name)
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Create train, validation, and test datasets for an embedding model."
+    )
+    parser.add_argument(
+        "--model",
+        choices=("all",) + EMBEDDING_MODEL_NAMES,
+        default="all",
+        help="Embedding model to optimize, or all three models (default).",
+    )
+    args = parser.parse_args()
+    main(None if args.model == "all" else args.model)

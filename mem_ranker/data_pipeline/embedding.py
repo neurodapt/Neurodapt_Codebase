@@ -6,7 +6,9 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
 
@@ -15,10 +17,13 @@ PROJECT_ROOT = HERE.parents[1]
 PAIRED_DATASET_PATH = HERE / "Breithaupt_Cleaned.csv"
 MODEL_DIR = HERE / "models"
 EMBEDDED_DATASET_DIR = HERE / "Embedded_dataset"
+BERT_MODEL_DIR = PROJECT_ROOT / "Clause_Seg" / "models" / "bert-base-uncased"
+BERT_MODEL_ID = "google-bert/bert-base-uncased"
 
 MODEL_IDS = {
     "all_mpnet_base_v2": "sentence-transformers/all-mpnet-base-v2",
     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
+    "bert_base_uncased": BERT_MODEL_ID,
 }
 OUTPUT_PATHS = {
     name: EMBEDDED_DATASET_DIR / f"embedded_stories_{name}.pt"
@@ -48,6 +53,51 @@ def _load_cached_sentence_transformer(name: str, device: str) -> SentenceTransfo
     return model
 
 
+def _bert_model_is_ready() -> bool:
+    return (
+        (BERT_MODEL_DIR / "config.json").is_file()
+        and any(
+            (BERT_MODEL_DIR / filename).is_file()
+            for filename in ("model.safetensors", "pytorch_model.bin")
+        )
+        and any(
+            (BERT_MODEL_DIR / filename).is_file()
+            for filename in ("tokenizer.json", "vocab.txt")
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def _load_cached_bert(device: str) -> tuple[AutoTokenizer, AutoModel]:
+    """Load the same BERT checkpoint used by the clause segmenter."""
+    BERT_MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+    cache_dir = MODEL_DIR / "huggingface_cache"
+
+    if _bert_model_is_ready():
+        source = str(BERT_MODEL_DIR)
+        tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
+        model = AutoModel.from_pretrained(source, local_files_only=True)
+    else:
+        print(f"Downloading/loading {BERT_MODEL_ID}...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            BERT_MODEL_ID,
+            cache_dir=str(cache_dir),
+        )
+        model = AutoModel.from_pretrained(
+            BERT_MODEL_ID,
+            cache_dir=str(cache_dir),
+        )
+        BERT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        tokenizer.save_pretrained(BERT_MODEL_DIR)
+        model.save_pretrained(BERT_MODEL_DIR, safe_serialization=True)
+
+    selected_device = torch.device(device)
+    model = model.to(selected_device)
+    model.eval()
+    print(f"Ready: {BERT_MODEL_ID} ({BERT_MODEL_DIR}) on {selected_device}")
+    return tokenizer, model
+
+
 class EmbeddingModels:
     """Load encoders on first use and keep them resident for this process."""
 
@@ -66,6 +116,8 @@ class EmbeddingModels:
         """Load and warm the named encoder before inference starts."""
         if model_name not in MODEL_IDS:
             raise KeyError(f"Unknown embedding model: {model_name}")
+        if model_name == "bert_base_uncased":
+            return _load_cached_bert(self.device)[1]
         return self._load_sentence_transformer(model_name)
 
     def encode(self, model_name: str, texts: list[str]) -> np.ndarray:
@@ -75,18 +127,37 @@ class EmbeddingModels:
             dimension = self.dimension(model_name)
             return np.empty((0, dimension), dtype=np.float32)
 
-        values = np.asarray(
-            self._load_sentence_transformer(model_name).encode(
+        if model_name == "bert_base_uncased":
+            tokenizer, model = _load_cached_bert(self.device)
+            encoding = tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            encoding = {
+                key: value.to(self.device)
+                for key, value in encoding.items()
+            }
+            with torch.no_grad():
+                hidden_states = model(**encoding).last_hidden_state
+            attention_mask = encoding["attention_mask"].unsqueeze(-1).float()
+            pooled = (hidden_states * attention_mask).sum(dim=1)
+            pooled = pooled / attention_mask.sum(dim=1).clamp_min(1.0)
+            values = F.normalize(pooled, p=2, dim=1).cpu().numpy()
+        else:
+            values = self._load_sentence_transformer(model_name).encode(
                 texts,
                 normalize_embeddings=True,
                 convert_to_numpy=True,
                 show_progress_bar=False,
-            ),
-            dtype=np.float32,
-        )
+            )
         return values
 
     def dimension(self, model_name: str) -> int:
+        if model_name == "bert_base_uncased":
+            return int(_load_cached_bert(self.device)[1].config.hidden_size)
         return int(self._load_sentence_transformer(model_name).get_sentence_embedding_dimension())
 
 

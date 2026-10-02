@@ -11,7 +11,11 @@ except ModuleNotFoundError:
 LOSS_PLOT_PATH = Path(__file__).resolve().parent / "training_loss.png"
 
 
-def save_loss_plot(training_losses: list[float], validation_losses: list[float]) -> None:
+def save_loss_plot(
+	training_losses: list[float],
+	validation_losses: list[float],
+	path: Path = LOSS_PLOT_PATH,
+) -> None:
 	if plt is None:
 		print("matplotlib is not installed; skipping loss plot")
 		return
@@ -26,7 +30,8 @@ def save_loss_plot(training_losses: list[float], validation_losses: list[float])
 	axis.grid(True, alpha=0.3)
 	axis.legend()
 	figure.tight_layout()
-	figure.savefig(LOSS_PLOT_PATH, dpi=150)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	figure.savefig(path, dpi=150)
 	plt.close(figure)
 
 
