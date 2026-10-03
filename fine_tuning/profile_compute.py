@@ -344,7 +344,7 @@ def main() -> None:
         output_dir=str(args.output_dir / "trainer-output"),
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
-        num_generations=4,
+        num_generations=2,
         learning_rate=5e-6,
         num_train_epochs=1,
         max_steps=args.steps + 1,

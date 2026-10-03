@@ -66,7 +66,7 @@ Bangalore, India\\
 \maketitle
 
 \begin{abstract}
-Large Language Models (LLMs) are increasingly used to rewrite, summarize, and simplify text while preserving its meaning. Most of these systems, however, are optimized for fluency, semantic similarity, or task performance rather than for the information a reader is likely to retain over time. We present Neurodapt, a framework for long term memory retention oriented rewriting that combines Transformer-based clause boundary predictor, a memory-ranking module and a GRPO fine tuned LLM . The intended rewriting objective is limited to three components: improving the Memory Ranker score, preserving semantic meaning using a BERT-based measure, and enforcing a length constraint. We report component-level Clause Segmentation, memory-ranking and LLM rewriting results.
+Large Language Models (LLMs) are increasingly used to rewrite, summarize, and simplify text while preserving its meaning. Most of these systems, however, are optimized for fluency, semantic similarity, or task performance rather than for the information a reader is likely to retain over time. We present Neurodapt, a framework for long term memory retention oriented rewriting that combines a Transformer-based clause boundary predictor, a memory-ranking module, and a GRPO fine-tuned LLM. The rewriting objective combines three components: improving the Memory Ranker score, preserving semantic meaning with an MPNet-based similarity measure, and enforcing a bounded length constraint. The BERT-based Memory Ranker configuration is used as the default ranker throughout the pipeline unless otherwise stated. We report component-level clause segmentation, memory-ranking, and LLM rewriting results.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -304,19 +304,27 @@ The following lines show the predicted memory score for each clause in the segme
 
 \section{Reinforcement Learning Pipeline}
 
-The intended RL reward is restricted to three components: (1) a Memory Ranker score for memorability, (2) a BERT-based semantic-preservation score comparing the source target clause with its rewrite, and (3) a length constraint. The training data are produced from 50-word windows with stride 50. The existing clause segmenter and Memory Ranker score each window; interior clauses are selected in center-out order as target examples. The prompt instructs the model to preserve the target meaning, avoid adding information or borrowing from other clauses, produce one sentence, and stay within 150\% of the original target's word count. Up to 20,000 valid examples are selected using seed 42 by default.
+The RL reward has three normalized components: (1) a Memory Ranker score for memorability, (2) an MPNet-based semantic-similarity score comparing the source target clause with its rewrite, and (3) a length-compliance score. Unless otherwise stated, the BERT-based Memory Ranker configuration is the default ranker used for clause scoring, dataset construction, inference, and reward computation. The training data are produced from 50-word windows with stride 50. The existing clause segmenter and Memory Ranker score each window; interior clauses are selected in center-out order as target examples. The prompt instructs the model to preserve the target meaning, avoid adding information or borrowing from other clauses, produce one sentence, and keep the rewrite between 70\% and 150\% of the original target's word count. Up to 20,000 valid examples are selected using seed 42 by default.
 
 The policy is the local Qwen2.5-0.5B-Instruct model, trained for one epoch with TRL's GRPO trainer. The run uses 4-bit NF4 quantization with double quantization, FP16 computation, and LoRA adapters (rank 8, alpha 16, dropout 0.05) on the query, key, value, and output projections. The per-device batch size is 2, gradient accumulation is 8, four completions are sampled per prompt, the learning rate is $5\times10^{-6}$, and the maximum prompt and completion lengths are 256 and 48 tokens. The saved run contains 5,000 training steps and reaches epoch 1.
 
-For each candidate, the reward scorer embeds the original target and rewrite with normalized MPNet embeddings and scores them together as a two-clause sequence. Let $\Delta=s_{\mathrm{rewrite}}-s_{\mathrm{original}}$, where each $s$ is the Memory Ranker's sigmoid output, and let $L_o$ and $L_w$ be the original and rewritten word counts. The implemented reward is
+For each candidate, the reward scorer embeds the original target and rewrite with normalized MPNet embeddings. The original embedding is cached and rewrite embeddings are computed in batches; the same embedding pair is reused for both the Memory Ranker and semantic-similarity components. Let $\Delta=s_{\mathrm{rewrite}}-s_{\mathrm{original}}$, where each $s$ is the Memory Ranker's sigmoid output, and let $L_o$ and $L_w$ be the original and rewritten word counts. The ranker component is normalized as $m=(\Delta+1)/2$, and the cosine-similarity component is normalized as $q=(1+\cos(e_o,e_w))/2$. Both therefore have the common base range $[0,1]$.
+
+The length component uses a fixed validity interval rather than a changing length limit:
 \begin{equation}
-R=\begin{cases}
--2.5, & L_o=0\text{ or }L_w=0,\\
-\Delta, & 2L_w\leq 3L_o,\\
--1.5-\left(\frac{L_w}{1.5L_o}-1\right)+0.25\Delta, & 2L_w>3L_o.
+\ell=\begin{cases}
+1, & 0.7L_o\leq L_w\leq 1.5L_o,\\
+0, & \text{otherwise.}
 \end{cases}
 \end{equation}
-Thus valid pairwise score differences lie in $[-1,1]$, while completions exceeding the 150\% word-count cap receive a rejection penalty plus an excess-length penalty and a small ranker-score contribution. The BERT-based semantic-preservation score will be added to this implemented ranker-and-length reward; it is not reflected in the checkpoint's training objective. In the intended three-component objective, the final reward will combine these ranker, BERT-semantic, and length-constraint signals, with no additional centrality or information-fidelity term.
+
+The weighted base reward is
+\begin{equation}
+R_{\mathrm{base}}=w_m m+w_\ell\ell+w_q q,
+\end{equation}
+where training begins with $(w_m,w_\ell,w_q)=(1/3,1/3,1/3)$. Empty outputs receive $-2.5$. Outputs outside the 70--150\% interval retain a separate rejection penalty, which is the minimum of the weighted reward and $-1.5$ minus a proportional excess-length term. This preserves a strong hard constraint without allowing the penalty scale to distort the normalized component weights.
+
+The length weight adapts during training while the 70--150\% interval remains fixed. Statistics are accumulated over a window of 32 non-empty candidates. If at least 10\% of candidates violate the interval, or at least 50\% lie within 5\% of either boundary, the length weight increases by 0.05, taking weight equally from the Memory Ranker and similarity components. If a window has no violations and no more than 25\% boundary-near candidates, the length weight decreases by 0.05, transferring that weight equally to the other two components. The length weight is bounded below by 0.04 and above by its initial value of $1/3$. Thus the objective can move toward, for example, approximately 48\% Memory Ranker, 4\% length, and 48\% similarity after stable length compliance, while restoring length pressure if the policy begins to exceed or crowd the fixed limit.
 
 \section{Experiments}
 
@@ -328,144 +336,106 @@ We tune the decision threshold on the validation set over 0.10--0.90 in steps of
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=\columnwidth,height=1.80in,keepaspectratio]{Fig_Threshold_F1.png}
+\includegraphics[width=\columnwidth,height=1.50in,keepaspectratio]{Fig_Threshold_F1.png}
 \caption{Validation F1 across decision thresholds; the selected threshold is $\tau=0.39$.}
 \label{fig:threshold_f1}
 \end{figure}
 
-We then fix this threshold and apply it to the held-out test set. The resulting precision is 0.8481, recall 0.8099, accuracy 0.9772, and F1 0.8285. Relative to the default threshold of 0.50, calibration improves precision and gives a modest F1 gain.
-
 \subsubsection{Positive-Class Weight Ablation}
 
-Because clause boundaries are a minority class in the HCA corpus (approximately 7.8\% of labels), we evaluated whether increasing the loss weight on boundary tokens improves separation between boundary and non-boundary positions. Table~\ref{tab:pos_weight_ablation} reports validation-set results for positive-class weights of 1, 2, 5, and 10 in the weighted BCE objective. The best overall model is obtained with the unweighted objective ($\texttt{pos\_weight}=1$), reaching F1 = 0.8510, precision = 0.8724, recall = 0.8306, and accuracy = 0.9808. Increasing the positive-class weight raises recall but lowers precision enough that F1 decreases; the highest recall occurs at $\texttt{pos\_weight}=5$ (0.8725), but at the cost of a substantially lower precision of 0.8001. These results suggest that the dataset imbalance is not severe enough to require aggressive reweighting, and the final segmentation setup therefore keeps the lower positive-class weight with the calibrated boundary threshold.
+Because clause boundaries are a minority class in the HCA corpus (approximately 7.8\% of labels), we evaluated whether increasing the loss weight on boundary tokens improves separation between boundary and non-boundary positions. Table~\ref{tab:pos_weight_ablation} reports validation-set results for positive-class weights of 1, 2, 5, and 10 in the weighted BCE objective. The best overall model is obtained with the unweighted objective ($\texttt{pos\_weight}=1$), reaching F1 = 0.8510. Increasing the positive-class weight raises recall but lowers precision enough that F1 decreases; the highest recall occurs at $\texttt{pos\_weight}=5$ (0.8725), but at the cost of a substantially lower precision of 0.8001. These results suggest that the dataset imbalance is not severe enough to require aggressive reweighting, and the final segmentation setup therefore keeps the lower positive-class weight with the calibrated boundary threshold.
 
 \begin{table}[H]
 \centering
 \caption{Validation-set ablation for positive-class weighting in the clause-boundary loss.}
 \label{tab:pos_weight_ablation}
+\footnotesize
+\renewcommand{\arraystretch}{1.1}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{cccccc}
+\begin{tabular}{ccccc}
 \hline
-\texttt{pos\_weight} & Best epoch & Precision & Recall & Accuracy & F1 \\
+\texttt{pos\_weight} & Precision & Recall & Accuracy & F1 \\
 \hline
-1 & 12 & 0.8724 & 0.8306 & 0.9808 & 0.8510 \\
-2 & 17 & 0.8484 & 0.8421 & 0.9797 & 0.8452 \\
-5 & 11 & 0.8001 & 0.8725 & 0.9772 & 0.8347 \\
-10 & 30 & 0.7958 & 0.8623 & 0.9763 & 0.8277 \\
+1  & 0.8724 & 0.8306 & 0.9808 & 0.8510 \\
+2  & 0.8484 & 0.8421 & 0.9797 & 0.8452 \\
+5  & 0.8001 & 0.8725 & 0.9772 & 0.8347 \\
+10 & 0.7958 & 0.8623 & 0.9763 & 0.8277 \\
 \hline
 \end{tabular}}
 \end{table}
 
 \subsection{Memory Ranking Results}
 
-Table~\ref{tab:memory_results} reports the exact evaluation output. The Memory Ranker improves on all listed baselines for MAE, RMSE, Spearman correlation, Kendall's $\tau$, pairwise accuracy, and all NDCG values. Its top-5 overlap of 0.2308 ties the random baseline and exceeds the position and MPNet baselines.
+\subsubsection{Experiment 1: Held-Out Test Evaluation}
 
-The benchmark contains only 13 stories, so these results support a useful ranking signal but do not establish a complete model of human memory.
+The Memory Ranker is evaluated on the held-out test split using both pointwise error and within-story ranking metrics. The test-set results are shown in Table~\ref{tab:memory_ranker_test}. The model achieves a Spearman correlation of 0.7079 and a Kendall rank correlation of 0.5605, indicating a consistent positive association between predicted and target memorability scores. Its pairwise accuracy is 0.7800, while the NDCG values remain above 0.86 across the reported cutoffs.
 
-\begin{table}[t]
+\begin{table}[H]
 \centering
-\caption{Memory ranking performance on the independent human-memory evaluation set. Lower is better for MAE and RMSE; higher is better for all other metrics.}
-\label{tab:memory_results}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lccccccccc}
+\caption{Memory Ranker performance on the held-out test split.}
+\label{tab:memory_ranker_test}
+\footnotesize
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lc}
 \hline
-Model & MAE & RMSE & Spearman & Kendall $\tau$ &
-Pairwise Acc. & NDCG@1 & NDCG@3 & NDCG@5 & Top-5 \\
+\textbf{Metric} & \textbf{Test score} \\
 \hline
-Memory Ranker & \textbf{0.2414} & \textbf{0.2923} & \textbf{0.2797} & \textbf{0.2097} &
-\textbf{0.6049} & \textbf{0.4999} & \textbf{0.5021} & \textbf{0.5232} & \textbf{0.2308} \\
-Random & 0.3486 & 0.4202 & -0.0497 & -0.0436 &
-0.4782 & 0.3728 & 0.4436 & 0.4690 & \textbf{0.2308} \\
-Position & 0.3621 & 0.4332 & -0.1096 & -0.0801 &
-0.4599 & 0.4032 & 0.4118 & 0.4378 & 0.1077 \\
-MPNet Embedding & 0.3518 & 0.4063 & 0.1282 & 0.0822 &
-0.5411 & 0.4883 & 0.4482 & 0.4735 & 0.1385 \\
+MAE & 0.1734 \\
+RMSE & 0.2143 \\
+Spearman correlation & 0.7079 \\
+Kendall's $\tau$ & 0.5605 \\
+Pairwise accuracy & 0.7800 \\
+NDCG@1 & 0.8697 \\
+NDCG@3 & 0.8674 \\
+NDCG@5 & 0.8813 \\
 \hline
-\end{tabular}}
+\end{tabular}
 \end{table}
 
-Figures~\ref{fig:ranking_metrics}--\ref{fig:error_metrics} summarize the ranking and prediction-error comparisons.
+\subsubsection{Experiment 2: Embedding Model Comparison}
 
-\begin{figure}[!t]
+In the second experiment, we evaluated the Memory Ranker with three embedding backbones: \texttt{all-mpnet-base-v2}, \texttt{all-MiniLM-L6-v2}, and \texttt{bert-base-uncased}. The ranker architecture, training procedure, and held-out test split were kept fixed; only the clause-embedding model and its corresponding input dimension were changed. Table~\ref{tab:embedding_comparison} summarizes the resulting test-set performance.
+
+\begin{table}[H]
 \centering
-\includegraphics[width=\columnwidth,height=1.85in,keepaspectratio]{Fig4_RankingMetrics.png}
-\caption{Comparison of ranking performance across the Memory Ranker and baseline methods.}
-\label{fig:ranking_metrics}
-\end{figure}
+\caption{Memory Ranker comparison across clause-embedding models.}
+\label{tab:embedding_comparison}
+\footnotesize
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{lccc}
+\hline
+\textbf{Metric} & \textbf{MPNet} & \textbf{MiniLM} & \textbf{BERT} \\
+\hline
+MAE & 0.1734 & 0.1724 & \textbf{0.1694} \\
+RMSE & 0.2143 & 0.2137 & \textbf{0.2089} \\
+Spearman correlation & 0.7079 & 0.7175 & \textbf{0.7365} \\
+Kendall's $\tau$ & 0.5605 & 0.5720 & \textbf{0.5841} \\
+Pairwise accuracy & 0.7800 & 0.7832 & \textbf{0.7948} \\
+NDCG@1 & \textbf{0.8697} & 0.8622 & 0.8513 \\
+NDCG@3 & 0.8674 & 0.8622 & 0.8641 \\
+NDCG@5 & 0.8813 & 0.8742 & \textbf{0.8819} \\
+\hline
+\end{tabular}
+\end{table}
 
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth,height=1.85in,keepaspectratio]{Fig5_NDCG.png}
-\caption{NDCG performance at different ranking depths.}
-\label{fig:ndcg_metrics}
-\end{figure}
+The BERT-based configuration gives the lowest MAE and RMSE and the highest Spearman correlation, Kendall rank correlation, and pairwise accuracy. This indicates that it provides the strongest overall agreement with the within-story target ordering. MPNet obtains the highest NDCG@1 and MiniLM provides a small improvement over MPNet in correlation and pairwise accuracy, showing that the choice of embedding model affects the ranking profile rather than producing a uniform improvement on every metric.
 
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth,height=1.70in,keepaspectratio]{Fig6_ErrorMetrics.png}
-\caption{Prediction error relative to human clause-recall probabilities.}
-\label{fig:error_metrics}
-\end{figure}
+We also inspected predictions on four manually constructed four-clause stories. All three configurations consistently assigned the highest score to the most salient introductory or distinctive clause in each story. The BERT-based model produced the best held-out metrics, while the manual rankings showed similar qualitative behavior across models, with differences mainly in the ordering of lower-scoring clauses. These examples provide a qualitative sanity check, but they are not used as a training or test set.
 
+\subsubsection{Experiment 3: Comparison with Existing Resources and Models}
+
+To the best of our investigation, we did not identify an existing publicly available dataset that provides sufficiently large-scale, clause-level human memorability or retention annotations for narratives in a form directly compatible with the proposed task. Existing narrative-memory datasets differ substantially in their experimental design, annotation granularity, or number and type of narrative stimuli. For example, existing work has investigated memory through large-scale narrative retellings, while other datasets provide participant recalls for a small number of narrative stimuli rather than clause-level retention annotations. Consequently, direct cross-dataset evaluation would require substantial changes to the target construction and would not constitute a controlled evaluation of the same prediction task.
+
+Similarly, we did not identify an existing model that performs the same clause-level relative memory-retention ranking task using comparable supervision. We therefore do not report a direct comparison against an external memorability-ranking baseline. Instead, model validity is evaluated through held-out story-level testing and controlled ablation experiments examining the contribution of the ranking objective, contextual modeling, positional information, normalization strategy, and semantic representation. These experiments are intended to establish whether the proposed architecture and target construction contribute meaningfully to the observed ranking performance.
 
 \subsection{GRPO Training Run}
-
-The GRPO experiment was designed as a controlled first test of whether a memorability-guided reward produces observable changes in a small instruction-tuned policy. The raw fine-tuning data were converted to CSV, and rows containing fewer than 50 whitespace-delimited words were removed. Each remaining text was divided into non-overlapping 50-word windows using a stride of 50. The clause segmenter and Memory Ranker were then applied to each window. Windows with fewer than three clauses were discarded, and the remaining interior clauses were selected in center-out order as target clauses. Each target produced one training example containing the ordered clause context, the target marker, the original target text, and its Memory Ranker score. This procedure generated 198,800 validatable examples in the stored preprocessing artifact.
-
-The trainer used a deterministic sample of 20,000 examples from these rows, selected with seed 42. This cap was chosen because the purpose of this run was to establish whether the reward and prompting scheme could produce measurable behavioral changes, rather than to maximize corpus coverage or claim dataset-size saturation. Using more windows was therefore not necessary for this initial diagnostic experiment and would have increased compute and training time without changing the question being tested. The 20,000 examples were used for the single training run; the preprocessing and trainer do not define a held-out validation or test partition, so the run cannot support generalization claims.
-
-Each prompt asked the policy to rewrite only the marked target clause, preserve its meaning, avoid information from neighboring clauses, produce one sentence, and remain within 150\% of the original target's word count. The local Qwen2.5-0.5B-Instruct model was loaded with 4-bit NF4 double-quantized weights and FP16 computation. LoRA was applied to the query, key, value, and output projections with rank 8, alpha 16, and dropout 0.05. TRL's GRPO configuration used a per-device batch size of 2, gradient accumulation of 8, four sampled completions per prompt, one epoch, a learning rate of $5\times10^{-6}$, gradient checkpointing, and a maximum completion length of 48 tokens. The maximum prompt length was 256 tokens. No external experiment tracker was used; metrics were written to the trainer log.
-
-The implemented reward uses the Memory Ranker score change for the target clause and a length constraint. If $s_o$ and $s_w$ are the ranker scores for the original and rewritten target in the same clause context, the score contribution is $\Delta=s_w-s_o$. Empty outputs receive a fixed penalty of $-2.5$. Rewrites within the 150\% word-count limit receive $\Delta$; longer rewrites receive a rejection penalty, an excess-length penalty, and a reduced $0.25\Delta$ contribution. The BERT-based semantic-preservation term described in the intended objective was not present in this run. Consequently, the run tests ranker-guided rewriting under a length constraint, not the complete three-component objective.
-
-The logged run completed one epoch in approximately $27{,}250$ seconds, corresponding to 5,000 training steps. The final trainer summary reports a training loss of 0.06289, while the last logged interval reports a reward mean of approximately $-0.184$, reward standard deviation 0.265, mean completion length 10.88 tokens, and clipped-completion ratio 0.0125. These values describe the optimization trajectory and sampling behavior only. In particular, the negative reward scale is expected under the implemented empty/overlength penalties and does not by itself imply failed learning. The run does not include held-out rewrite-quality, semantic-fidelity, or human-retention measurements.
-
-\IfFileExists{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/loss_reward.png}{%
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/loss_reward.png}
-\caption{GRPO loss and reward recorded during the 20,000-example training run.}
-\label{fig:grpo_loss_reward}
-\end{figure}
-}{}
-
-\IfFileExists{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/reward_statistics.png}{%
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth,height=1.05in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/reward_statistics.png}
-\includegraphics[width=\columnwidth,height=1.05in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/completion_lengths.png}
-\caption{Reward variability and generated completion lengths during GRPO training.}
-\label{fig:grpo_reward_lengths}
-\end{figure}
-}{}
-
-\IfFileExists{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/learning_rate.png}{%
-\begin{figure}[!t]
-\centering
-\includegraphics[width=\columnwidth,height=0.70in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/learning_rate.png}
-\includegraphics[width=\columnwidth,height=0.70in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/entropy_gradient_norm.png}
-\includegraphics[width=\columnwidth,height=0.70in,keepaspectratio]{fine_tuning/outputs/Qwen2.5-0.5-Instruct-GRPO/plots/clipped_ratio.png}
-\caption{Learning-rate decay, entropy and gradient-norm behavior, and completion clipping during the run.}
-\label{fig:grpo_training_diagnostics}
-\end{figure}
-}{}
 
 
 \section{Discussion}
 
-Taken together, the component-level experiments support the feasibility of the proposed pipeline. Clause segmentation reaches an F1 of 0.8285 on the held-out HCA test set, and the Memory Ranker improves on the listed baselines on several ranking measures, including pairwise accuracy and the NDCG metrics.
-
-The benchmark also highlights an important limitation: it contains only 13 stories, and the training targets are indirect proxies formed from retelling similarity. The current Memory Ranker is therefore better interpreted as a useful ranking signal, not as a complete model of human memory.
-
-A second limitation concerns how the training targets are constructed. They are inferred by matching original clauses to human retellings rather than obtained from direct clause-level retention labels. The independent human-memory benchmark provides an external check, but its small size means that broader claims about human memory should be made cautiously. The current maintained pipeline uses retelling-only targets; it does not support conclusions about the comparative contribution of semantic centrality because the earlier ratio sweep is not reproduced by the current target-generation script.
-
-The current GRPO implementation is a limited experiment rather than a complete evaluation of the Neurodapt hypothesis: its reward optimizes Memory Ranker score change for one target clause and penalizes empty or overlength completions. The intended BERT-based semantic-preservation component has not yet been integrated. The saved adapter confirms that training ran, but the work does not yet report held-out measurements of semantic preservation, rewrite quality, or human retention. These evaluations should be conducted after integrating the full intended three-component reward.
 
 \section{Conclusion}
 
-This paper introduced Neurodapt, a modular framework that combines clause-level segmentation, narrative-based memorability estimation, and GRPO-based target-clause rewriting. The segmentation model reaches an F1 of 0.8285, while the independent human-memory benchmark shows that the retelling-trained Memory Ranker outperforms listed baselines on several metrics. The ranker is trained on within-story normalized retelling-match scores; the current implementation does not use a centrality mixture, and the earlier ratio sweep is not reproduced by the maintained pipeline. The current GRPO trainer uses a ranker-score-difference reward with a length constraint; the intended BERT-based semantic-preservation term has not yet been integrated. The effect on semantic preservation, generated-text quality, and human retention has not yet been measured. The small benchmark and absence of a controlled rewrite evaluation limit conclusions about broader human-memory alignment and end-to-end benefit.
-
-These findings motivate testing human-aligned memorability signals as an objective for LLM-based rewriting. Future work should integrate the BERT-based semantic-preservation reward and evaluate the resulting three-component objective (Memory Ranker, BERT semantic preservation, and length constraint) against controlled baselines using rewrite quality and direct human-retention measures.
 
 \balance
 \small

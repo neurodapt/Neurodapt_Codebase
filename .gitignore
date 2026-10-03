@@ -9,9 +9,10 @@ Clause_Seg/models
 
 mem_ranker/data_pipeline/optimized_data
 mem_ranker/data_pipeline/models
+mem_ranker/models
 mem_ranker/data_pipeline/Embedded_dataset
 
 
-fine_tuning/data_pipeline
+fine_tuning/data_pipeline/processed_data
+fine_tuning/data_pipeline/preprocessed_grpo.pt
 fine_tuning/models
-fine_tuning/outputs
