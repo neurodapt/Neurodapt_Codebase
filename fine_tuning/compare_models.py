@@ -18,8 +18,8 @@ from tqdm import tqdm
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent
 BASE_MODEL_PATH = HERE / "models" / "Qwen2.5-0.5B-Instruct"
-ADAPTER_PATH = HERE / "outputs" / "Qwen2.5-0.5-Instruct-GRPO"
-COMPARISON_OUTPUT_DIR = HERE / "outputs" / "Qwen2.5-0.5-Instruct-GRPO" / "comparison"
+ADAPTER_PATH = HERE / "outputs" / "Qwen2.5-0.5B-Instruct-GRPO"
+COMPARISON_OUTPUT_DIR = HERE / "outputs" / "Qwen2.5-0.5B-Instruct-GRPO" / "comparison"
 MEMORY_RANKER_PATH = PROJECT_ROOT / "mem_ranker" / "memory_ranker_model_best.pt"
 EMBEDDING_MODEL_PATH = (
     PROJECT_ROOT / "mem_ranker" / "data_pipeline" / "models" / "all_mpnet_base_v2"

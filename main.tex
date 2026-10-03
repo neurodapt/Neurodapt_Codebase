@@ -66,7 +66,7 @@ Bangalore, India\\
 \maketitle
 
 \begin{abstract}
-Large Language Models (LLMs) are increasingly used to rewrite, summarize, and simplify text while preserving its meaning. Most of these systems, however, are optimized for fluency, semantic similarity, or task performance rather than for the information a reader is likely to retain over time. We present Neurodapt, a framework for long term memory retention oriented rewriting that combines a Transformer-based clause boundary predictor, a memory-ranking module, and a GRPO fine-tuned LLM. The rewriting objective combines three components: improving the Memory Ranker score, preserving semantic meaning with an MPNet-based similarity measure, and enforcing a bounded length constraint. The BERT-based Memory Ranker configuration is used as the default ranker throughout the pipeline unless otherwise stated. We report component-level clause segmentation, memory-ranking, and LLM rewriting results.
+ We present Neurodapt, a framework for long term memory retention oriented rewriting that combines a Transformer-based clause boundary predictor, a memory-ranking module, and a GRPO fine-tuned LLM. The rewriting objective combines three components: improving the Memory Ranker score, preserving semantic meaning with an similarity measure, and dynamically enforcing a bounded length constraint.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -75,18 +75,12 @@ Large Language Models, Reinforcement Learning, Educational Technology, Memory Mo
 
 \section{Introduction}
 
-
-
-LLMs have made rewriting, summarization, and educational content generation easier to automate. Yet the objectives used by many systems focus on linguistic quality or semantic preservation rather than on whether important information will be retained by the reader in the long term. A rewrite can therefore be faithful in meaning while still changing the cues that that can help the user's brain retain the information.
-
-We propose \textbf{Neurodapt}, an approach to memory-oriented note rewriting. The framework first divides a note into clauses, estimates their relative memorability using a model trained on narrative recall data, and then uses those estimates to train a model to rewrite the text at a clause level. Its main contributions are:
+LLM automate text generation but do not focus on whether important information will be retained by the reader in the long term. A rewrite can therefore be faithful in meaning while still changing the parts that can help the user retain the information. We propose \textbf{Neurodapt}, an approach to memory-oriented text rewriting. Its main contributions are:
 \begin{enumerate}
 \item A clause-boundary prediction module that uses a Transformer to estimate the probability of each token being a clause boundary.
 \item A Transformer-based Memory Ranker trained from narrative retelling data to estimate relative clause memorability.
 \item An LLM fine-tuned with GRPO to rewrite clauses toward higher memory-retention scores produced by the Memory Ranker.
 \end{enumerate}
-
-Together, these components form a pipeline for identifying clause boundaries, estimating their memory-retention scores, and optimizing clauses for improved retention.
 
 \section{Related Work}
 
@@ -418,9 +412,7 @@ NDCG@5 & 0.8813 & 0.8742 & \textbf{0.8819} \\
 \end{tabular}
 \end{table}
 
-The BERT-based configuration gives the lowest MAE and RMSE and the highest Spearman correlation, Kendall rank correlation, and pairwise accuracy. This indicates that it provides the strongest overall agreement with the within-story target ordering. MPNet obtains the highest NDCG@1 and MiniLM provides a small improvement over MPNet in correlation and pairwise accuracy, showing that the choice of embedding model affects the ranking profile rather than producing a uniform improvement on every metric.
-
-We also inspected predictions on four manually constructed four-clause stories. All three configurations consistently assigned the highest score to the most salient introductory or distinctive clause in each story. The BERT-based model produced the best held-out metrics, while the manual rankings showed similar qualitative behavior across models, with differences mainly in the ordering of lower-scoring clauses. These examples provide a qualitative sanity check, but they are not used as a training or test set.
+The BERT-based configuration gives the lowest MAE and RMSE and the highest Spearman correlation, Kendall rank correlation, and pairwise accuracy. This indicates that it provides the strongest overall agreement with the within-story target ordering.
 
 \subsubsection{Experiment 3: Comparison with Existing Resources and Models}
 
@@ -430,11 +422,54 @@ Similarly, we did not identify an existing model that performs the same clause-l
 
 \subsection{GRPO Training Run}
 
+The GRPO run used 20,000 examples sampled from 198,800 validatable rows with seed 42. Training completed one epoch and 5,000 optimizer steps. The parser recovered 500 logged training records through epoch 1.0. The reward was noisy, as expected from sampled generations and a composite reward: it changed from $-1.746$ at the first logged point to $-0.168$ at the final logged point, with a maximum observed logged reward of $0.178$. The mean reward over the logged points was $-0.254$, while the mean loss was $0.0353$. Completion lengths decreased from a mean of 27.41 tokens at the first logged point to 15.61 tokens at the final logged point. Figure~\ref{fig:grpo_training_curves} shows the primary loss and reward trends.
 
-\section{Discussion}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\columnwidth]{loss_reward.png}
+\caption{GRPO loss and reward trends over training.}
+\label{fig:grpo_training_curves}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\columnwidth]{clipped_ratio.png}
+\caption{Fraction of generated completions reaching the maximum completion length.}
+\label{fig:grpo_clipping}
+\end{figure}
+
+The trained adapter was also compared with the original Qwen2.5-0.5B-Instruct model using the 54 built-in contextual prompts in \texttt{compare\_models.py}. Both outputs were scored in their original clause context using the same Memory Ranker. The adapter obtained a slightly higher mean score, although the improvement was small and occurred on 26 of 54 prompts, so this comparison should be interpreted as a diagnostic rather than evidence of a statistically significant gain. The adapter outputs were shorter on average, as shown in Table~\ref{tab:grpo_comparison}. The per-prompt scores and score changes are plotted in Figs.~\ref{fig:grpo_comparison} and~\ref{fig:grpo_score_delta}.
+
+\begin{table}[H]
+\centering
+\caption{Base-model and GRPO-adapter comparison over 54 prompts.}
+\label{tab:grpo_comparison}
+\footnotesize
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{lc}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Mean base Memory Ranker score & 0.4672 \\
+Mean adapter Memory Ranker score & 0.4684 \\
+Mean score change & +0.0012 \\
+Prompts with positive score change & 26/54 \\
+Mean base output length & 13.69 words \\
+Mean adapter output length & 8.87 words \\
+\hline
+\end{tabular}
+\end{table}
 
 
-\section{Conclusion}
+
+The remaining generated diagnostics and parsed metric CSV are retained as supplementary result assets. The small average score change motivates evaluation on a larger held-out prompt set and direct human-retention measurements.
+
+\section{Discussion and Conclusion}
+
+
+These results should be interpreted as evidence of optimization toward the learned memory objective rather than direct evidence of improved human memory. The Memory Ranker is itself a learned proxy for retention, and the current evaluation does not include human recall measurements. Nevertheless, the results demonstrate the feasibility of using a learned clause-level memory signal as a reward for targeted LLM rewriting.
+
+Overall, Neurodapt provides a complete pipeline from clause segmentation and memory estimation to reinforcement-learning-based rewriting. Future work should evaluate generated rewrites through controlled human memory experiments and investigate whether improvements in the learned memory score translate to measurable improvements in actual information retention.
 
 
 \balance
